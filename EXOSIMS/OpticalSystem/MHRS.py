@@ -128,6 +128,7 @@ class MHRS(OpticalSystem):
             C_star, C_p, C_sr, C_z, C_ez, C_dc, C_bl, Npix = out
 
         return C_star, C_p, C_sr, C_z, C_ez, C_dc, C_bl, Npix
+
     def Cp_Cb_Csp(self, TL, sInds, fZ, JEZ, dMag, WA, mode, returnExtra=False, TK=None):
         """Calculates electron count rates for planet signal, background noise,
         and speckle residuals.
@@ -253,8 +254,307 @@ class MHRS(OpticalSystem):
         else:
             return _C_p << self.inv_s, _C_b << self.inv_s, _C_sp << self.inv_s
 
+    def Cp_Cb_Csp_spec(self, TL, sInds, fZ, JEZ, dMag, WA, mode, returnExtra=False, TK=None, pl_waves = None,
+                       pl_template = None, R_pl_template=None,pl_template_name=None,n_jobs=-1,broaden_pixel=True):
+        """Similar to self.Cp_Cb_Csp() but returning spectra instead of broadband fluxes.
+        Calculates different spectra with the electron count rates for planet signal, background noise,and speckle residuals.
+
+        Args:
+            TL (:ref:`TargetList`):
+                TargetList class object
+            sInds (~numpy.ndarray(int)):
+                Integer indices of the stars of interest
+            fZ (~astropy.units.Quantity(~numpy.ndarray(float))):
+                Surface brightness of local zodiacal light in units of 1/arcsec2
+            JEZ (astropy Quantity array):
+                Intensity of exo-zodiacal light in units of ph/s/m2/arcsec2
+            dMag (~numpy.ndarray(float)):
+                Differences in magnitude between planets and their host star
+            WA (~astropy.units.Quantity(~numpy.ndarray(float))):
+                Working angles of the planets of interest in units of arcsec
+            mode (dict):
+                Selected observing mode
+            returnExtra (bool):
+                Optional flag, default False, set True to return additional rates for
+                validation
+            TK (:ref:`TimeKeeping`, optional):
+                Optional TimeKeeping object (default None), used to model detector
+                degradation effects where applicable.
+            pl_waves (~numpy.ndarray(float)):
+                Wavelength array of planet spectral tempalte
+            pl_template (List of ~numpy.ndarray(float)):
+                List of planet albeda spectral template. If more than one, this can include molecular templates.
+            R_pl_template:
+                Spectral resolution of the pl_template spectrum as way to know what is the maximum spectral resolution for this calculation.
+            pl_template_name (List of str)
+                List of the names for the spectral templates in pl_template.
+                e.g. ["all","H2O","O2"]
+            n_jobs (int):
+                Number of parallel jobs (-1 = all cores).
+                Not parallelized if 0.
+            broaden_pixel (Boolean):
+                If True, subsequently broadens the spectrum the insturment resolution and then to the pixel width. Otherwise,
+                only broaden to the instrumental resolution, and effectively assume that the pixel broadening is included in it.
+                If samples_only is not None, having broaden_pixel=True is much slower.
+
+
+        Returns:
+            tuple:
+                C_p (~astropy.units.Quantity(~numpy.ndarray(float))):
+                    Planet signal electron count rate in units of 1/s
+                C_b (~astropy.units.Quantity(~numpy.ndarray(float))):
+                    Background noise electron count rate in units of 1/s
+                C_sp (~astropy.units.Quantity(~numpy.ndarray(float))):
+                    Residual speckle spatial structure (systematic error)
+                    in units of 1/s
+
+        """
+        inst = mode["inst"]
+        if "spectro" not in inst["name"].lower():
+            raise Exception(inst["name"] + " is not a spectrograph. A spectrograph is needed for using Cp_Cb_Csp_spec().")
+
+        # todo: do not hard code R_star_template = 500
+        # todo: implement high res stellar models
+        # todo: fix pl_template_incl_star = pl_template_cropped#*star_template_resampled
+        # todo: make flat spectrum if pl_template is None
+
+        if isinstance(pl_template, (np.ndarray)):
+            pl_template = [pl_template]
+        if pl_template_name is None:
+            pl_template_name = "TBD"
+        if isinstance(pl_template_name, str):
+            pl_template_name = [pl_template_name]
+
+        # Create output lists to manage the fact that a set of stars/WA/etc can be given as an input
+        star_template_scaled_C_sr_list = []
+        _C_z_spec_list = []
+        _C_ez_spec_list = []
+        _C_dc_spec_list = []
+        _C_cc_spec_list = []
+        _C_rn_spec_list = []
+        _C_star_spec_list = []
+        pl0_template_scaled_C_p0_list = []
+        _C_bl_spec_list = []
+
+        pl0_template_scaled_C_p_list = []
+        _C_b_spec_list = []
+        star_template_scaled_C_sp_list = []
+
+        pl_mol_template_scaled_C_p_list = []
+
+        for j in range(len(sInds)):
+
+            _, _, C_sp,C_extra = self.Cp_Cb_Csp(TL, sInds[j], fZ[j], JEZ[j], dMag[j], WA[j], mode, TK=TK,returnExtra=True)
+            C_sp=C_sp#*40
+            _C_p0 = C_extra["C_p0"]
+            _C_sr =  C_extra["C_sr"]#*0.41616687/0.00069059
+            _C_z =  C_extra["C_z"]
+            _C_ez =  C_extra["C_ez"]
+            _C_dc =  C_extra["C_dc"]
+            _C_bl = C_extra["C_bl"]
+            _C_star = C_extra["C_star"]
+            Npix = C_extra["Npix"]
+
+            # Assume `bandpass` is your synphot.SpectralElement object
+            bandpass_waves = mode["bandpass"].waveset
+            bandpass_filter = mode["bandpass"](bandpass_waves)
+            bandpass_func = interp1d(bandpass_waves, bandpass_filter, bounds_error=False, fill_value=0)
+            nonzero = bandpass_filter > 0.01
+            min_wave_bandpass = bandpass_waves[nonzero][0] # wavelength has units (Angstrom most likely)
+            max_wave_bandpass = bandpass_waves[nonzero][-1]
+            lambda_center = 0.5 * (min_wave_bandpass + max_wave_bandpass)
+
+            # Obtain the renormalized spectral template using the new method
+            # JB note: apparently the resolution is about ~500, for now hard coding R_star = 500
+            R_star_template = 500
+            star_template_obj = TL.get_spectral_template(sInds[j], mode)
+            # star_template_flux = Observation(star_template, mode["bandpass"], force="taper").integrate()
+            star_waves = star_template_obj.waveset # has units
+            star_template = star_template_obj(star_waves)
+            if star_template.unit != synphot.units.PHOTLAM:
+                # Just making sure that the spectrum is in PHOTLAM. Not sure if actually needed? TBchecked
+                raise Exception("Units of star_template should be synphot.units.PHOTLAM, it is {0} instead".format(star_template.unit))
+            star_template = star_template.value
+            # normalize the star_template to have max flux of unity
+            star_template = star_template / np.nanmax(star_template)
+
+            if inst["Rs"] > R_pl_template/2.:
+                raise ValueError(
+                    "Instrument resolution is higher than 1/2 the planet template resolution.")
+            if inst["Rs"] > R_star_template/2.:
+                warnings.warn(
+                    "Instrument resolution is higher than 1/2 the stellar template resolution.")
+
+            # extract relevant subset of the template wavelength axes to speed up subsequent processing
+            # Apply margin
+            wmin_with_margin = min_wave_bandpass - 2*min_wave_bandpass / inst["Rs"]
+            wmax_with_margin = max_wave_bandpass + 2*max_wave_bandpass / inst["Rs"]
+            # crop planet template
+            pl_mask = (pl_waves.to(u.nm).value >= wmin_with_margin.to(u.nm).value) & (pl_waves.to(u.nm).value <= wmax_with_margin.to(u.nm).value)
+            pl_waves_cropped = pl_waves[pl_mask]
+            # crop planet template
+            star_mask = (star_waves.to(u.nm).value >= wmin_with_margin.to(u.nm).value) & (star_waves.to(u.nm).value <= wmax_with_margin.to(u.nm).value)
+            star_waves_cropped = star_waves[star_mask]
+            star_template_cropped = star_template[star_mask]
+
+            pixPerLens = inst["lenslSamp"] #Number of pixels per spectral resolution elements
+            delta_lambda = lambda_center / inst["Rs"]  # resolution element width
+            pixel_spacing = delta_lambda / pixPerLens  # wavelength spacing per pixel
+            num_pixels = int(np.floor((max_wave_bandpass - min_wave_bandpass) / pixel_spacing)) + 1
+            data_waves = min_wave_bandpass + pixel_spacing * np.arange(num_pixels)
+            data_waves_diff = np.diff(data_waves, prepend=2 * data_waves[0] - data_waves[1])
+
+            star_template_resampled = np.interp(
+                pl_waves_cropped.to(u.nm).value,
+                star_waves_cropped.to(u.nm).value,
+                star_template_cropped
+            )
+            star_template_resamp = broaden_and_resample(data_waves, pl_waves_cropped, star_template_resampled,
+                                                        inst["Rs"], n_jobs=n_jobs, broaden_pixel=broaden_pixel)
+            # apply filter profile to spectra
+            star_template_filt = star_template_resamp*bandpass_func(data_waves)
+            # Normalize
+            star_template_norma = star_template_filt / np.sum(star_template_filt)
+            # Scale to photons/sec
+            star_template_scaled_C_sr = star_template_norma * _C_sr
+            star_template_scaled_C_sp = star_template_norma * C_sp
+            _C_star_spec = star_template_norma * _C_star
+
+            ########
+            ## This part broadens and scale the planet albedo spectral template including all the molecules ("pl0")
+            pl0_template = pl_template[0]
+            pl0_template_cropped = pl0_template[pl_mask]
+            # todo: include stellar template multiplication since the RV features will be shifted
+            pl0_template_incl_star = pl0_template_cropped#*star_template_resampled
+            pl0_template_resamp= broaden_and_resample(data_waves, pl_waves_cropped, pl0_template_incl_star, inst["Rs"],n_jobs=n_jobs, broaden_pixel = broaden_pixel)
+            # apply filter profile to spectra
+            pl0_template_filt = pl0_template_resamp*bandpass_func(data_waves)
+            # Normalize and scale to photons/sec
+            pl0_template_norm_factor = np.sum(pl0_template_filt)
+            pl0_template_scaled_C_p0 = pl0_template_filt/pl0_template_norm_factor * _C_p0
+            ########
+
+            # exposure time
+            if self.texp_flag:
+                with np.errstate(divide="ignore", invalid="ignore"):
+                    texp = 1 / _C_p0 / 10  # Use 1/C_p0 as frame time for photon counting
+            else:
+                texp = inst["texp"].to(u.s)
+            # readout noise
+            _C_rn_spec = np.full_like(pl0_template_scaled_C_p0, Npix * inst["sread"] / texp)
+
+            # clock-induced-charge
+            _C_cc_spec = np.full_like(pl0_template_scaled_C_p0, Npix * inst["CIC"] / texp)
+
+            # Dark current
+            _C_dc_spec = np.full_like(pl0_template_scaled_C_p0, _C_dc)
+
+
+            # zodi and exozodi spectra. Assuming flat spectra for now.
+            _C_z_spec = np.full_like(pl0_template_scaled_C_p0, _C_z / np.size(data_waves))
+            _C_ez_spec = np.full_like(pl0_template_scaled_C_p0, _C_ez / np.size(data_waves))
+
+            # Background leakage spectrum
+            _C_bl_spec = np.full_like(pl0_template_scaled_C_p0, _C_bl / np.size(data_waves))
+
+            # C_p = PLANET SIGNAL RATE
+            # photon counting efficiency
+            PCeff = inst["PCeff"]
+            # radiation dosage
+            radDos = mode["radDos"]
+            # photon-converted 1 frame (minimum 1 photon)
+            # there may be zeros in the denominator. Suppress the resulting warning:
+            with np.errstate(divide="ignore", invalid="ignore"):
+                phConv = np.clip(((pl0_template_scaled_C_p0 + star_template_scaled_C_sr + _C_z_spec + _C_ez_spec) / Npix * texp), 1, None)
+            # net charge transfer efficiency
+            with np.errstate(invalid="ignore"):
+                NCTE = 1.0 + (radDos / 4.0) * 0.51296 * (np.log10(phConv) + 0.0147233)
+            # planet signal rate
+            pl0_template_scaled_C_p = pl0_template_scaled_C_p0 * PCeff * NCTE
+            # possibility of Npix=0 may lead C_p to be nan.  Change these to zero instead.
+            pl0_template_scaled_C_p[np.isnan(pl0_template_scaled_C_p)] = 0
+
+            # C_b = NOISE VARIANCE RATE
+            # corrections for Ref star Differential Imaging e.g. dMag=3 and 20% time on ref
+            # k_SZ for speckle and zodi light, and k_det for detector
+            k_SZ = (
+                1.0 + 1.0 / (10 ** (0.4 * self.ref_dMag) * self.ref_Time)
+                if self.ref_Time > 0
+                else 1.0
+            )
+            k_det = 1.0 + self.ref_Time
+            # calculate Cb
+            ENF2 = inst["ENF"] ** 2
+            _C_b_spec = k_SZ * ENF2 * (star_template_scaled_C_sr + _C_z_spec + _C_ez_spec + _C_bl_spec) + k_det * (
+                    ENF2 * (_C_dc_spec + _C_cc_spec) + _C_rn_spec
+            )
+            # for characterization, Cb must include the planet
+            if not (mode["detectionMode"]):
+                _C_b_spec = _C_b_spec + ENF2 * pl0_template_scaled_C_p0
+            # print("ENF2 * pl0_template_scaled_C_p0",intTime*ENF2 * pl0_template_scaled_C_p0)
+
+            if returnExtra:
+                ########
+                ## If molecular templates are available, then process those:
+                pl_mol_template_scaled_C_p0 = {}
+                pl_mol_template_scaled_C_p = {}
+                # spectral_envelop = np.nanmax(pl_template,axis=0)
+                for pl_mol_template, mol_name in zip(pl_template[1::],pl_template_name[1::]):
+                    # subtract envelop of the spectrum because we only one the SNR corresponding to the detection of a molecule
+                    # pl_mol_template = molecular_template-spectral_envelop
+                    pl_mol_template_cropped = pl_mol_template[pl_mask]
+                    pl_mol_template_incl_star = pl_mol_template_cropped#*star_template_resampled
+                    pl_mol_template_resamp= broaden_and_resample(data_waves, pl_waves_cropped, pl_mol_template_incl_star, inst["Rs"],n_jobs=n_jobs, broaden_pixel = broaden_pixel)
+                    # apply filter profile to spectra
+                    pl_mol_template_filt = pl_mol_template_resamp*bandpass_func(data_waves)
+                    # Normalize and scale to photons/sec, but use normalization from original planet spectrum
+                    pl_mol_template_scaled_C_p0[mol_name] = pl_mol_template_filt/pl0_template_norm_factor * _C_p0
+                    # planet signal rate
+                    pl_mol_template_scaled_C_p[mol_name] = pl_mol_template_scaled_C_p0[mol_name] * PCeff * NCTE
+                    # possibility of Npix=0 may lead C_p to be nan.  Change these to zero instead.
+                    pl_mol_template_scaled_C_p[mol_name][np.isnan(pl_mol_template_scaled_C_p[mol_name])] = 0
+
+                pl_mol_template_scaled_C_p_list.append(pl_mol_template_scaled_C_p)
+
+            star_template_scaled_C_sr_list.append(star_template_scaled_C_sr << self.inv_s)
+            _C_z_spec_list.append(_C_z_spec << self.inv_s)
+            _C_ez_spec_list.append(_C_ez_spec << self.inv_s)
+            _C_dc_spec_list.append(_C_dc_spec << self.inv_s)
+            _C_cc_spec_list.append(_C_cc_spec << self.inv_s)
+            _C_rn_spec_list.append(_C_rn_spec << self.inv_s)
+            _C_star_spec_list.append(_C_star_spec << self.inv_s)
+            pl0_template_scaled_C_p0_list.append(pl0_template_scaled_C_p0 << self.inv_s)
+            _C_bl_spec_list.append(_C_bl_spec << self.inv_s)
+
+            pl0_template_scaled_C_p_list.append(pl0_template_scaled_C_p << self.inv_s)
+            _C_b_spec_list.append(_C_b_spec << self.inv_s)
+            star_template_scaled_C_sp_list.append(star_template_scaled_C_sp << self.inv_s)
+
+        if returnExtra:
+            # organize components into an optional fourth result
+            C_spec_extra = dict(
+                C_sr_spec=star_template_scaled_C_sr_list, # starlight before post-processing
+                C_z_spec=_C_z_spec_list,
+                C_ez_spec=_C_ez_spec_list,
+                C_dc_spec=_C_dc_spec_list,
+                C_cc_spec=_C_cc_spec_list,
+                C_rn_spec=_C_rn_spec_list,
+                C_star_spec=_C_star_spec_list,
+                C_p0_spec=pl0_template_scaled_C_p0_list,
+                C_bl_spec=_C_bl_spec_list,
+                C_p_mol_spec = pl_mol_template_scaled_C_p_list,
+                Npix_per_bin=Npix,
+                k_SZ=k_SZ,
+                k_det=k_det,
+                ENF2=ENF2,
+                lambda_center=lambda_center,
+            )
+            return data_waves, pl0_template_scaled_C_p_list, _C_b_spec_list, star_template_scaled_C_sp_list, C_spec_extra
+        else:
+            return data_waves, pl0_template_scaled_C_p_list, _C_b_spec_list, star_template_scaled_C_sp_list
+
     def calc_snr(self, TL, sInds, fZ, JEZ, dMag, WA, mode, TK=None, pl_waves = None, pl_template = None, R_pl_template=None,pl_template_name=None,
-                 out_SNR_dict = None,figs=None,n_jobs=-1,broaden_pixel=True):
+                 figs=None,n_jobs=-1,broaden_pixel=True):
         """Calculate SNR of target systems for given integration time for a specific observing
         mode (imaging or characterization), based on Nemati 2014 (SPIE).
 
@@ -276,11 +576,17 @@ class MHRS(OpticalSystem):
             TK (TimeKeeping object):
                 Optional TimeKeeping object (default None), used to model detector
                 degradation effects where applicable.
-            pl_waves:
-            pl_template:
+            pl_waves (~numpy.ndarray(float)):
+                Wavelength array of planet spectral tempalte
+            pl_template (List of ~numpy.ndarray(float)):
+                List of planet albeda spectral template. If more than one, this can include molecular templates.
             R_pl_template:
-            out_SNR_dict:
+                Spectral resolution of the pl_template spectrum as way to know what is the maximum spectral resolution for this calculation.
+            pl_template_name (List of str)
+                List of the names for the spectral templates in pl_template.
+                e.g. ["all","H2O","O2"]
             figs (list of figure object):
+                TBD
             n_jobs (int):
                 Number of parallel jobs (-1 = all cores).
                 Not parallelized if 0.
@@ -299,15 +605,12 @@ class MHRS(OpticalSystem):
         inst = mode["inst"]
         syst = mode["syst"]
         if "spectro" in inst["name"].lower():
-            # todo: do not hard code R_star_template = 500
-            # todo: implement high res stellar models
-            # todo: fix pl_template_incl_star = pl_template_cropped#*star_template_resampled
-
             if isinstance(pl_template, (np.ndarray)):
                 pl_template = [pl_template]
             if isinstance(pl_template_name, str):
                 pl_template_name = [pl_template_name]
 
+            # Define all the output arrays for the SNR
             SNR_dict = {}
             SNR = np.full(shape=len(sInds), fill_value=np.nan)
             for _pl_name in pl_template_name:
@@ -315,178 +618,79 @@ class MHRS(OpticalSystem):
                 SNR_dict[_pl_name+"_avg_per_bin"] = np.full(shape=len(sInds), fill_value=np.nan)
                 SNR_dict[_pl_name+"_uncorr_small_scale"] = np.full(shape=len(sInds), fill_value=np.nan)
                 SNR_dict[_pl_name+"_corr_large_scale"] = np.full(shape=len(sInds), fill_value=np.nan)
+                SNR_dict[_pl_name+"_corr_test"] = np.full(shape=len(sInds), fill_value=np.nan)
                 SNR_dict[_pl_name+"_corr"] = np.full(shape=len(sInds), fill_value=np.nan)
+
+            out = self.Cp_Cb_Csp_spec(TL, sInds, fZ, JEZ, dMag, WA, mode, TK=TK, returnExtra=True,
+                                      pl_waves=pl_waves, pl_template=pl_template,
+                                      R_pl_template=R_pl_template, pl_template_name=pl_template_name,
+                                      n_jobs=n_jobs, broaden_pixel=broaden_pixel)
+            data_waves = out[0] # Wavelength sampling of the "data", ie the spectra below
+            pl0_template_scaled_C_p_list = out[1]   # List of planet spectra (including PCeff * NCTE)
+            _C_b_spec_list = out[2]  # List of white noise stddev spectra (including k_SZ, ENF2, k_det)
+            star_template_scaled_C_sp_list = out[3] # List of residual starlight spectra, ie correlated noise (_C_sr * post processing factor * stability factor)
+
+            C_extra = out[4] # The outputs in there do not typically include the photon counting detector stuff
+            pl0_template_scaled_C_p0_list = C_extra["C_p0_spec"] # List of planet spectra (NOT including PCeff * NCTE)
+            star_template_scaled_C_sr_list = C_extra["C_sr_spec"] # List of starlight spectra (before post-processing)
+            _C_z_spec_list = C_extra["C_z_spec"] # List of Zodi spectra
+            _C_ez_spec_list = C_extra["C_ez_spec"] # List of exzodi spectra
+            _C_dc_spec_list = C_extra["C_dc_spec"] # List of dark current spectra
+            _C_bl_spec_list = C_extra["C_bl_spec"]
+            _C_star_spec_list = C_extra["C_star_spec"]
+            _C_rn_spec_list = C_extra["C_rn_spec"] # List of read noise spectra
+            _C_cc_spec_list = C_extra["C_cc_spec"] # List of clock-induced charge spectra
+            Npix = C_extra["Npix_per_bin"]
+            k_SZ = C_extra["k_SZ"]
+            k_det = C_extra["k_det"]
+            ENF2 = C_extra["ENF2"]
+            lambda_center = C_extra["lambda_center"] # Center wavelength of the bandpass
+
+            pl_mol_template_scaled_C_p_list = C_extra["C_p_mol_spec"]
+
             for j in range(len(sInds)):
-
-                _, _, C_sp,C_extra = self.Cp_Cb_Csp(TL, sInds[j], fZ[j], JEZ[j], dMag[j], WA[j], mode, TK=TK,returnExtra=True)
-                C_sp=C_sp#*40
-                _C_p0 = C_extra["C_p0"]
-                _C_sr =  C_extra["C_sr"]#*0.41616687/0.00069059
-                _C_z =  C_extra["C_z"]
-                _C_ez =  C_extra["C_ez"]
-                _C_dc =  C_extra["C_dc"]
-                _C_bl = C_extra["C_bl"]
-                Npix = C_extra["Npix"]
-                print(C_extra)
-                # exit()
-
-                # Assume `bandpass` is your synphot.SpectralElement object
-                bandpass_waves = mode["bandpass"].waveset
-                bandpass_filter = mode["bandpass"](bandpass_waves)
-                bandpass_func = interp1d(bandpass_waves, bandpass_filter, bounds_error=False, fill_value=0)
-                nonzero = bandpass_filter > 0.01
-                min_wave_bandpass = bandpass_waves[nonzero][0] # wavelength has units (Angstrom most likely)
-                max_wave_bandpass = bandpass_waves[nonzero][-1]
-
-                # Obtain the renormalized spectral template using the new method
-                # JB note: apparently the resolution is about ~500, for now hard coding R_star = 500
-                R_star_template = 500
-                star_template_obj = TL.get_spectral_template(sInds[j], mode)
-                # star_template_flux = Observation(star_template, mode["bandpass"], force="taper").integrate()
-                star_waves = star_template_obj.waveset # has units
-                star_template = star_template_obj(star_waves)
-                if star_template.unit != synphot.units.PHOTLAM:
-                    # Just making sure that the spectrum is in PHOTLAM. Not sure if actually needed? TBchecked
-                    raise Exception("Units of star_template should be synphot.units.PHOTLAM, it is {0} instead".format(star_template.unit))
-                star_template = star_template.value
-                # normalize the star_template to have max flux of unity
-                star_template = star_template / np.nanmax(star_template)
-
-                if inst["Rs"] > R_pl_template/2.:
-                    raise ValueError(
-                        "Instrument resolution is higher than 1/2 the planet template resolution.")
-                if inst["Rs"] > R_star_template/2.:
-                    warnings.warn(
-                        "Instrument resolution is higher than 1/2 the stellar template resolution.")
-
-                # extract relevant subset of the template wavelength axes to speed up subsequent processing
-                # Apply margin
-                wmin_with_margin = min_wave_bandpass - 2*min_wave_bandpass / inst["Rs"]
-                wmax_with_margin = max_wave_bandpass + 2*max_wave_bandpass / inst["Rs"]
-                # crop planet template
-                pl_mask = (pl_waves.to(u.nm).value >= wmin_with_margin.to(u.nm).value) & (pl_waves.to(u.nm).value <= wmax_with_margin.to(u.nm).value)
-                pl_waves_cropped = pl_waves[pl_mask]
-                # crop planet template
-                star_mask = (star_waves.to(u.nm).value >= wmin_with_margin.to(u.nm).value) & (star_waves.to(u.nm).value <= wmax_with_margin.to(u.nm).value)
-                star_waves_cropped = star_waves[star_mask]
-                star_template_cropped = star_template[star_mask]
-
-                pixPerLens = inst["lenslSamp"] #Number of pixels per spectral resolution elements
-                lambda_center = 0.5 * (min_wave_bandpass + max_wave_bandpass)
-                delta_lambda = lambda_center / inst["Rs"]  # resolution element width
-                pixel_spacing = delta_lambda / pixPerLens  # wavelength spacing per pixel
-                num_pixels = int(np.floor((max_wave_bandpass - min_wave_bandpass) / pixel_spacing)) + 1
-                data_waves = min_wave_bandpass + pixel_spacing * np.arange(num_pixels)
-                data_waves_diff = np.diff(data_waves, prepend=2 * data_waves[0] - data_waves[1])
-
-                star_template_resampled = np.interp(
-                    pl_waves_cropped.to(u.nm).value,
-                    star_waves_cropped.to(u.nm).value,
-                    star_template_cropped
-                )
-                star_template_resamp = broaden_and_resample(data_waves, pl_waves_cropped, star_template_resampled,
-                                                            inst["Rs"], n_jobs=n_jobs, broaden_pixel=broaden_pixel)
-                # apply filter profile to spectra
-                star_template_filt = star_template_resamp*bandpass_func(data_waves)
-                # Normalize
-                star_template_norma = star_template_filt / np.sum(star_template_filt)
-                # Scale to photons/sec
-                star_template_scaled_C_sr = star_template_norma * _C_sr
-                star_template_scaled_C_sp = star_template_norma * C_sp
-
-                ########
-                ## This part broadens and scale the planet albedo spectral template including all the molecules ("pl0")
-                pl0_template = pl_template[0]
-                pl0_template_cropped = pl0_template[pl_mask]
-                # todo: include stellar template multiplication since the RV features will be shifted
-                pl0_template_incl_star = pl0_template_cropped#*star_template_resampled
-                pl0_template_resamp= broaden_and_resample(data_waves, pl_waves_cropped, pl0_template_incl_star, inst["Rs"],n_jobs=n_jobs, broaden_pixel = broaden_pixel)
-                # apply filter profile to spectra
-                pl0_template_filt = pl0_template_resamp*bandpass_func(data_waves)
-                # Normalize and scale to photons/sec
-                pl0_template_norm_factor = np.sum(pl0_template_filt)
-                pl0_template_scaled_C_p0 = pl0_template_filt/pl0_template_norm_factor * _C_p0
-                ########
-
-                # exposure time
-                if self.texp_flag:
-                    with np.errstate(divide="ignore", invalid="ignore"):
-                        texp = 1 / _C_p0 / 10  # Use 1/C_p0 as frame time for photon counting
-                else:
-                    texp = inst["texp"].to(u.s)
-                # readout noise
-                _C_rn_spec = np.full_like(pl0_template_scaled_C_p0, Npix * inst["sread"] / texp)
-
-                # clock-induced-charge
-                _C_cc_spec = np.full_like(pl0_template_scaled_C_p0, Npix * inst["CIC"] / texp)
-
-                # Dark current
-                _C_dc_spec = np.full_like(pl0_template_scaled_C_p0, _C_dc)
+                # Just grab every single spectra for all the lists above
+                pl0_template_scaled_C_p = pl0_template_scaled_C_p_list[j]
+                _C_b_spec = _C_b_spec_list[j]
+                star_template_scaled_C_sp = star_template_scaled_C_sp_list[j]
+                pl0_template_scaled_C_p0 = pl0_template_scaled_C_p0_list[j]
+                star_template_scaled_C_sr = star_template_scaled_C_sr_list[j]
+                _C_z_spec = _C_z_spec_list[j]
+                _C_ez_spec = _C_ez_spec_list[j]
+                _C_dc_spec = _C_dc_spec_list[j]
+                _C_bl_spec = _C_bl_spec_list[j]
+                _C_star_spec = _C_star_spec_list[j]
+                _C_rn_spec = _C_rn_spec_list[j]
+                _C_cc_spec = _C_cc_spec_list[j]
+                pl_mol_template_scaled_C_p = pl_mol_template_scaled_C_p_list[j]
 
 
-                # zodi and exozodi spectra. Assuming flat spectra for now.
-                _C_z_spec = np.full_like(pl0_template_scaled_C_p0, _C_z / np.size(data_waves))
-                _C_ez_spec = np.full_like(pl0_template_scaled_C_p0, _C_ez / np.size(data_waves))
-                print("_C_ez_spec",np.sum(_C_ez_spec))
-                print("star_template_scaled_C_sr",np.sum(star_template_scaled_C_sr))
-
-                # Background leakage spectrum
-                _C_bl_spec = np.full_like(pl0_template_scaled_C_p0, _C_bl / np.size(data_waves))
-
-
-                # C_p = PLANET SIGNAL RATE
-                # photon counting efficiency
-                PCeff = inst["PCeff"]
-                # radiation dosage
-                radDos = mode["radDos"]
-                # photon-converted 1 frame (minimum 1 photon)
-                # there may be zeros in the denominator. Suppress the resulting warning:
-                with np.errstate(divide="ignore", invalid="ignore"):
-                    phConv = np.clip(((pl0_template_scaled_C_p0 + star_template_scaled_C_sr + _C_z_spec + _C_ez_spec) / Npix * texp), 1, None)
-                # net charge transfer efficiency
-                with np.errstate(invalid="ignore"):
-                    NCTE = 1.0 + (radDos / 4.0) * 0.51296 * (np.log10(phConv) + 0.0147233)
-                # planet signal rate
-                pl0_template_scaled_C_p = pl0_template_scaled_C_p0 * PCeff * NCTE
-                # possibility of Npix=0 may lead C_p to be nan.  Change these to zero instead.
-                pl0_template_scaled_C_p[np.isnan(pl0_template_scaled_C_p)] = 0
-
-                # C_b = NOISE VARIANCE RATE
-                # corrections for Ref star Differential Imaging e.g. dMag=3 and 20% time on ref
-                # k_SZ for speckle and zodi light, and k_det for detector
-                k_SZ = (
-                    1.0 + 1.0 / (10 ** (0.4 * self.ref_dMag) * self.ref_Time)
-                    if self.ref_Time > 0
-                    else 1.0
-                )
-                k_det = 1.0 + self.ref_Time
-                # calculate Cb
-                ENF2 = inst["ENF"] ** 2
-                _C_b_spec = k_SZ * ENF2 * (star_template_scaled_C_sr + _C_z_spec + _C_ez_spec + _C_bl_spec) + k_det * (
-                        ENF2 * (_C_dc_spec + _C_cc_spec) + _C_rn_spec
-                )
-                # for characterization, Cb must include the planet
-                if not (mode["detectionMode"]):
-                    _C_b_spec = _C_b_spec + ENF2 * pl0_template_scaled_C_p0
-                # print("ENF2 * pl0_template_scaled_C_p0",intTime*ENF2 * pl0_template_scaled_C_p0)
-
-                m = intTime * k_SZ * ENF2 * pl0_template_scaled_C_p0
+                # Define the "model" vector, ie the sigla
+                m = intTime * pl0_template_scaled_C_p
+                # Define the corresponding noise vector
                 s = np.sqrt(intTime * _C_b_spec + (intTime * star_template_scaled_C_sp)**2)
-                # print("intTime * _C_b_spec",intTime * _C_b_spec)
-                # print("intTime * star_template_scaled_C_sp",intTime * star_template_scaled_C_sp)
 
+                # Compute SNR with matched filter formula ignoring any correlations
                 SNR_dict[pl_template_name[0]+"_ignore_corr"][j] = np.sqrt(np.nansum(m**2/s**2))
+                # SNR per spectral bin
                 SNR_dict[pl_template_name[0]+"_avg_per_bin"][j] = np.nanmean(m/s)
+                # This is for the default SNR being returned by the function. Currently set to the SNR where the correlations are ignored.
                 SNR[j] = SNR_dict[pl_template_name[0]+"_ignore_corr"][j]
 
                 if "chromaticity_dwave_nm" in syst.keys():
-                    # print(syst["chromaticity_dwave_nm"])
-                    # print(mode["lam"])
-                    # print(self.pupilDiam)
-                    # print(WA[j], WA[j].to(u.rad))
+                    inv_cov0,cov_matrix0,corr_matrix0 = self.compute_cov_matrices(data_waves, WA, syst["chromaticity_dwave_nm"],
+                                                                               100*intTime * star_template_scaled_C_sp,
+                                                                               np.sqrt(intTime * _C_b_spec))
+                    # Broadband SNR accounting for the covariance.
+                    SNR_dict[pl_template_name[0] + "_corr"][j] = np.sqrt(np.linalg.multi_dot([m.T,inv_cov0,m]))
+
+                    #####
+                    ## The following is trying to decompose the spectrum into a small scale and large scale features to
+                    ## see where the signal is
+                    #####
 
                     # Compute correlation wavelength scale due to general PSF magnification
-                    corr_scale = np.sqrt(2) * data_waves ** 2 / (self.pupilDiam * WA[j].to(u.rad).value)
+                    corr_scale = 1.22/(2*np.sqrt(np.log(2))) * data_waves ** 2 / (self.pupilDiam * WA[j].to(u.rad).value)
                     corr_scale = corr_scale.decompose().to(u.nm)
 
                     # Set the maximum value of the correlation scale to the chromaticity scale
@@ -511,90 +715,32 @@ class MHRS(OpticalSystem):
                     m_ls = downsample_spectrum(data_waves.to_value(u.nm), m_ls, ls_waves.to_value(u.nm))
                     corr_starlight_ls = downsample_spectrum(data_waves.to_value(u.nm), corr_starlight_ls, ls_waves.to_value(u.nm))
 
-                    # Compute small scale SNR, which is assumed to be uncorrelated
+                    # SNR only including the features with a spectral scale SMALLER than the correlation length (ie, HIGH-pass filtered)
                     s_ss = np.sqrt(intTime * _C_b_spec)
                     SNR_dict[pl_template_name[0] + "_uncorr_small_scale"][j] = np.sqrt(np.nansum(m_ss ** 2 / s_ss ** 2))
 
-                    mean_ls_wave_matrix = (ls_waves[:, None] + ls_waves[None, :]) / 2
-                    corr_scale_matrix = np.sqrt(2) * mean_ls_wave_matrix ** 2 / (self.pupilDiam * WA[j].to(u.rad).value)
-                    corr_scale_matrix = corr_scale_matrix.decompose().to(u.nm)
-                    # Set the maximum value of the correlation scale to the chromaticity scale
-                    corr_scale_matrix = np.clip(corr_scale_matrix, 0, (syst["chromaticity_dwave_nm"] * u.nm).to(corr_scale_matrix.unit))
-                    diff_ls_wave_matrix = np.abs(ls_waves[:, None] - ls_waves[None, :])
-                    corr_matrix = np.exp(-0.5*diff_ls_wave_matrix.to_value(u.nm)**2/corr_scale_matrix.to_value(u.nm)**2)
-
-                    std_ls_corr = corr_starlight_ls
                     var_ls_uncorr = intTime * downsample_spectrum(data_waves.to_value(u.nm), _C_b_spec, ls_waves.to_value(u.nm))
-                    cov_matrix = np.diag(var_ls_uncorr)+(std_ls_corr[:, None] * std_ls_corr[None, :])*corr_matrix
-                    cov_matrix = cov_matrix.value
+                    inv_cov,cov_matrix,corr_matrix = self.compute_cov_matrices(ls_waves, WA, syst["chromaticity_dwave_nm"], 100*corr_starlight_ls,np.sqrt(var_ls_uncorr))
 
-                    # (sign, logdet) = np.linalg.slogdet(cov_matrix)
-                    # print(sign, logdet)
-                    cond_number = np.linalg.cond(cov_matrix, p=2)
-                    if cond_number > 1e6:
-                        # regularize covariance and inverse
-                        inv_cov, regularized_cov, eigvecs = regularized_inverse(cov_matrix,threshold=1e-6)
-                    else:
-                        inv_cov = np.linalg.inv(cov_matrix)
-
+                    # SNR only including the features with a spectral scale LARGER than the correlation length  (ie, LOW-pass filtered)
                     SNR_dict[pl_template_name[0] + "_corr_large_scale"][j] = np.sqrt(np.linalg.multi_dot([m_ls.T,inv_cov,m_ls]))
-                    SNR_dict[pl_template_name[0] + "_corr"][j] = np.sqrt(SNR_dict[pl_template_name[0] + "_corr_large_scale"][j]**2+
+                    # Simply combine the small scale and large scale SNRs in quadrature for comparison
+                    SNR_dict[pl_template_name[0] + "_corr_test"][j] = np.sqrt(SNR_dict[pl_template_name[0] + "_corr_large_scale"][j]**2+
                                                                          SNR_dict[pl_template_name[0] + "_uncorr_small_scale"][j]**2)
-                    # print("SNR corr",SNR_dict[pl_template_name[0] + "_corr_large_scale"][j])
-
-                    # print(SNR_dict)
-                    # print(corr_scale_matrix)
-                    # import matplotlib.pyplot as plt
-                    # plt.figure(figs[j])
-                    # plt.plot(data_waves,m,label="m")
-                    # plt.plot(ls_waves,m_ls,"x",label="m_ls")
-                    # plt.plot(data_waves,m_ss,label="m_ss")
-                    # plt.legend()
-                    #
-                    # plt.figure()
-                    # plt.imshow(corr_matrix,interpolation="nearest")
-                    # plt.clim([0,1])
-                    # plt.colorbar()
-                    #
-                    # plt.figure()
-                    # plt.imshow(cov_matrix,interpolation="nearest")
-                    # plt.colorbar()
-                    #
-                    # plt.figure()
-                    # plt.imshow(inv_cov,interpolation="nearest")
-                    # plt.colorbar()
-                    # plt.show()
-                    # exit()
-
                 ########
                 ## If molecular templates are available, then process those:
-                pl_mol_template_filt = {}
-                pl_mol_template_scaled_C_p0 = {}
-                # spectral_envelop = np.nanmax(pl_template,axis=0)
                 for pl_mol_template, mol_name in zip(pl_template[1::],pl_template_name[1::]):
-                    # subtract envelop of the spectrum because we only one the SNR corresponding to the detection of a molecule
-                    # pl_mol_template = molecular_template-spectral_envelop
-                    pl_mol_template_cropped = pl_mol_template[pl_mask]
-                    pl_mol_template_incl_star = pl_mol_template_cropped#*star_template_resampled
-                    pl_mol_template_resamp= broaden_and_resample(data_waves, pl_waves_cropped, pl_mol_template_incl_star, inst["Rs"],n_jobs=n_jobs, broaden_pixel = broaden_pixel)
-                    # apply filter profile to spectra
-                    pl_mol_template_filt[mol_name] = pl_mol_template_resamp*bandpass_func(data_waves)
-                    # Normalize and scale to photons/sec, but use normalization from original planet spectrum
-                    pl_mol_template_scaled_C_p0[mol_name] = pl_mol_template_filt[mol_name]/pl0_template_norm_factor * _C_p0
-                    # planet signal rate
-                    pl_mol_template_scaled_C_p = pl_mol_template_scaled_C_p0[mol_name] * PCeff * NCTE
-                    # possibility of Npix=0 may lead C_p to be nan.  Change these to zero instead.
-                    pl_mol_template_scaled_C_p[np.isnan(pl_mol_template_scaled_C_p)] = 0
 
-                    m = intTime * k_SZ * ENF2 * pl_mol_template_scaled_C_p0[mol_name]
+                    m = intTime * pl_mol_template_scaled_C_p[mol_name]
                     SNR_dict[mol_name+"_ignore_corr"][j] = np.sqrt(np.nansum(m**2/s**2))
+                    SNR_dict[mol_name + "_corr"][j] = np.sqrt(np.linalg.multi_dot([m.T,inv_cov0,m]))
 
                     m_ls = broaden(data_waves, m, corr_R, kernel="gaussian",n_jobs=n_jobs)
                     m_ss = m-m_ls
                     SNR_dict[mol_name + "_uncorr_small_scale"][j] = np.sqrt(np.nansum(m_ss ** 2 / s_ss ** 2))
                     m_ls = downsample_spectrum(data_waves.to_value(u.nm), m_ls, ls_waves.to_value(u.nm))
                     SNR_dict[mol_name + "_corr_large_scale"][j] = np.sqrt(np.linalg.multi_dot([m_ls.T,inv_cov,m_ls]))
-                    SNR_dict[mol_name + "_corr"][j] = np.sqrt(SNR_dict[mol_name + "_corr_large_scale"][j]**2+
+                    SNR_dict[mol_name + "_corr_test"][j] = np.sqrt(SNR_dict[mol_name + "_corr_large_scale"][j]**2+
                                                               SNR_dict[mol_name + "_uncorr_small_scale"][j]**2)
 
                 if figs is not None:
@@ -635,10 +781,10 @@ class MHRS(OpticalSystem):
                     plt.title("Simulation; Exposure time: {0}; Spectral resolution: {1:.0f}".format(intTime,inst["Rs"]))
                     # _C_b_spec = k_SZ * ENF2 * (star_template_scaled_C_sr + _C_z_spec + _C_ez_spec + _C_bl_spec) + k_det * (
                     #         ENF2 * (_C_dc_spec + _C_cc_spec) + _C_rn_spec
-                    plt.plot(data_waves.to(u.nm).value, intTime * k_SZ * ENF2 * pl0_template_scaled_C_p0,"o", label="Planet",color="blue")
-                    plt.plot(data_waves.to(u.nm).value, intTime * k_SZ * ENF2 * star_template_scaled_C_sr,"*", label="Starlight (before subtraction)",color="red")
+                    plt.plot(data_waves.to(u.nm).value, intTime * pl0_template_scaled_C_p,"o", label="Planet",color="blue")
+                    plt.plot(data_waves.to(u.nm).value, intTime * star_template_scaled_C_sr,"*", label="Starlight (before subtraction)",color="red")
 
-                    plt.plot(data_waves.to(u.nm).value, np.sqrt(intTime * k_SZ * ENF2 * pl0_template_scaled_C_p0),"--", label="Planet (stddev)")
+                    plt.plot(data_waves.to(u.nm).value, np.sqrt(intTime * ENF2 * pl0_template_scaled_C_p0),"--", label="Planet (stddev)")
                     plt.plot(data_waves.to(u.nm).value, np.sqrt(intTime * k_SZ * ENF2 * star_template_scaled_C_sr),"--", label="Starlight (stddev)")
                     plt.plot(data_waves.to(u.nm).value, np.sqrt(intTime * k_det * ENF2 * _C_dc_spec),"--", label="Dark current (stddev)")
                     plt.plot(data_waves.to(u.nm).value, np.sqrt(intTime * k_det * ENF2 * _C_cc_spec),"--", label="clock-induced-charge (stddev)")
@@ -656,8 +802,6 @@ class MHRS(OpticalSystem):
                     plt.grid(True)
                     # plt.tight_layout()
                     # plt.show()
-
-            # exit()
 
             return SNR,SNR_dict
         else:
@@ -678,6 +822,40 @@ class MHRS(OpticalSystem):
 
 
             return SNR
+
+    def compute_cov_matrices(self,ls_waves, WA, chromaticity_dwave_nm, std_corr, std_uncorr):
+        """
+        todo Write documentation
+        :param mode:
+        :param ls_waves:
+        :param WA:
+        :param std_ls_corr:
+        :param var_ls_uncorr:
+        :return:
+        """
+
+        mean_ls_wave_matrix = (ls_waves[:, None] + ls_waves[None, :]) / 2
+        corr_scale_matrix = np.sqrt(2) * mean_ls_wave_matrix ** 2 / (self.pupilDiam * WA.to(u.rad).value)
+        corr_scale_matrix = corr_scale_matrix.decompose().to(u.nm)
+        # Set the maximum value of the correlation scale to the chromaticity scale
+        corr_scale_matrix = np.clip(corr_scale_matrix, 0,
+                                    (chromaticity_dwave_nm* u.nm).to(corr_scale_matrix.unit))
+        diff_ls_wave_matrix = np.abs(ls_waves[:, None] - ls_waves[None, :])
+        corr_matrix = np.exp(-0.5 * diff_ls_wave_matrix.to_value(u.nm) ** 2 / corr_scale_matrix.to_value(u.nm) ** 2)
+
+        cov_matrix = np.diag(std_uncorr**2) + (std_corr[:, None] * std_corr[None, :]) * corr_matrix
+        cov_matrix = cov_matrix.value
+
+        # (sign, logdet) = np.linalg.slogdet(cov_matrix)
+        # print(sign, logdet)
+        cond_number = np.linalg.cond(cov_matrix, p=2)
+        if cond_number > 1e6:
+            # regularize covariance and inverse
+            inv_cov, regularized_cov, eigvecs = regularized_inverse(cov_matrix, threshold=1e-6)
+        else:
+            inv_cov = np.linalg.inv(cov_matrix)
+
+        return inv_cov,cov_matrix,corr_matrix
 
     def calc_intTime(self, TL, sInds, fZ, JEZ, dMag, WA, mode, TK=None):
         """Finds integration times of target systems for a specific observing
