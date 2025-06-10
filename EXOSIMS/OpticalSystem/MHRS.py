@@ -398,7 +398,6 @@ class MHRS(OpticalSystem):
         for j in range(len(sInds)):
 
             _, _, C_sp,C_extra = self.Cp_Cb_Csp(TL, sInds[j], fZ[j], JEZ[j], dMag[j], WA[j], mode, TK=TK,returnExtra=True)
-            C_sp=C_sp#*40
             _C_p0 = C_extra["C_p0"]
             _C_sr =  C_extra["C_sr"]#*0.41616687/0.00069059
             _C_z =  C_extra["C_z"]
@@ -407,6 +406,9 @@ class MHRS(OpticalSystem):
             _C_bl = C_extra["C_bl"]
             _C_star = C_extra["C_star"]
             Npix = C_extra["Npix"]
+            if "override_local_starlight_flux_ratio" in mode["syst"].keys():
+                _C_sr = _C_star* mode["syst"]["override_local_starlight_flux_ratio"]
+                C_sp = _C_sr * TL.PostProcessing.ppFact_char(WA) * self.stabilityFact
 
             # Obtain the renormalized spectral template using the new method
             # JB note: apparently the resolution is about ~500, for now hard coding R_star = 500
@@ -501,6 +503,20 @@ class MHRS(OpticalSystem):
             _C_b_spec = k_SZ * ENF2 * (star_template_scaled_C_sr + _C_z_spec + _C_ez_spec + _C_bl_spec) + k_det * (
                     ENF2 * (_C_dc_spec + _C_cc_spec) + _C_rn_spec
             )
+            if "use_ADI" in mode.keys():
+                if mode["use_ADI"]:
+                    # double noise of everything is using ADI
+                    _C_z_spec *=2
+                    _C_ez_spec *=2
+                    _C_bl_spec *=2
+                    _C_dc_spec *=2
+                    _C_cc_spec *=2
+                    _C_rn_spec *=2
+
+                    _C_b_spec *=2
+                    star_template_scaled_C_sp *=2
+                    star_template_scaled_C_sr *=2
+
             # for characterization, Cb must include the planet
             if not (mode["detectionMode"]):
                 _C_b_spec = _C_b_spec + ENF2 * pl0_template_scaled_C_p0
@@ -559,7 +575,7 @@ class MHRS(OpticalSystem):
             return data_waves, pl0_template_scaled_C_p_list, _C_b_spec_list, star_template_scaled_C_sp_list
 
     def calc_snr(self, TL, sInds, fZ, JEZ, dMag, WA, mode, TK=None, pl_waves = None, pl_template = None, R_pl_template=None,pl_template_name=None,
-                 figs=None,n_jobs=-1,broaden_pixel=True):
+                 figs=None,n_jobs=-1,broaden_pixel=True,output_filename=None,config_json_path=None):
         """Calculate SNR of target systems for given integration time for a specific observing
         mode (imaging or characterization), based on Nemati 2014 (SPIE).
 
@@ -599,6 +615,12 @@ class MHRS(OpticalSystem):
                 If True, subsequently broadens the spectrum the insturment resolution and then to the pixel width. Otherwise,
                 only broaden to the instrumental resolution, and effectively assume that the pixel broadening is included in it.
                 If samples_only is not None, having broaden_pixel=True is much slower.
+            output_filename (str):
+                Path to the output text file where the results will be written. Existing files
+                with the same name will be overwritten.
+            config_json_path (str):
+                Path to the JSON configuration file used to generate the results. This will be appended
+                at the end of the output file as a commented block for reference.
 
         Returns:
             intTime (astropy Quantity array):
@@ -618,13 +640,14 @@ class MHRS(OpticalSystem):
             # Define all the output arrays for the SNR
             SNR_dict = {}
             SNR = np.full(shape=len(sInds), fill_value=np.nan)
+            SNR_dict["stars"] = TL.Name
+            SNR_dict["SNR_"+pl_template_name[0]+"_avg_per_bin"] = np.full(shape=len(sInds), fill_value=np.nan)
             for _pl_name in pl_template_name:
-                SNR_dict[_pl_name+"_ignore_corr"] = np.full(shape=len(sInds), fill_value=np.nan)
-                SNR_dict[_pl_name+"_avg_per_bin"] = np.full(shape=len(sInds), fill_value=np.nan)
-                SNR_dict[_pl_name+"_uncorr_small_scale"] = np.full(shape=len(sInds), fill_value=np.nan)
-                SNR_dict[_pl_name+"_corr_large_scale"] = np.full(shape=len(sInds), fill_value=np.nan)
-                SNR_dict[_pl_name+"_corr_test"] = np.full(shape=len(sInds), fill_value=np.nan)
-                SNR_dict[_pl_name+"_corr"] = np.full(shape=len(sInds), fill_value=np.nan)
+                SNR_dict["SNR_"+_pl_name+"_ignore_corr"] = np.full(shape=len(sInds), fill_value=np.nan)
+                SNR_dict["SNR_"+_pl_name+"_uncorr_small_scale"] = np.full(shape=len(sInds), fill_value=np.nan)
+                SNR_dict["SNR_"+_pl_name+"_corr_large_scale"] = np.full(shape=len(sInds), fill_value=np.nan)
+                SNR_dict["SNR_"+_pl_name+"_corr_test"] = np.full(shape=len(sInds), fill_value=np.nan)
+                SNR_dict["SNR_"+_pl_name+"_corr"] = np.full(shape=len(sInds), fill_value=np.nan)
 
             out = self.Cp_Cb_Csp_spec(TL, sInds, fZ, JEZ, dMag, WA, mode, TK=TK, returnExtra=True,
                                       pl_waves=pl_waves, pl_template=pl_template,
@@ -651,6 +674,17 @@ class MHRS(OpticalSystem):
             ENF2 = C_extra["ENF2"]
             lambda_center = C_extra["lambda_center"] # Center wavelength of the bandpass
 
+            SNR_dict["C_planet"] = np.nansum(np.array(intTime * pl0_template_scaled_C_p_list),axis=1)
+            SNR_dict["C_star"] = np.nansum(np.array(intTime * _C_star_spec_list),axis=1)
+            SNR_dict["C_local_starlight"] = np.nansum(np.array(intTime * star_template_scaled_C_sr_list),axis=1)
+            SNR_dict["C_correlated_speckles"] = np.nansum(np.array(intTime * star_template_scaled_C_sp_list),axis=1)
+            SNR_dict["C_zodi"] = np.nansum(np.array(intTime * _C_z_spec_list),axis=1)
+            SNR_dict["C_exozodi"] = np.nansum(np.array(intTime * _C_ez_spec_list),axis=1)
+            SNR_dict["C_background_leakage"] = np.nansum(np.array(intTime * _C_bl_spec_list),axis=1)
+            SNR_dict["C_readnoise"] = np.nansum(np.array(intTime * _C_rn_spec_list),axis=1)
+            SNR_dict["C_dark"] = np.nansum(np.array(intTime * _C_dc_spec_list),axis=1)
+            SNR_dict["C_CIC"] = np.nansum(np.array(intTime * _C_cc_spec_list),axis=1)
+
             pl_mol_template_scaled_C_p_list = C_extra["C_p_mol_spec"]
 
             for j in range(len(sInds)):
@@ -676,18 +710,16 @@ class MHRS(OpticalSystem):
                 s = np.sqrt(intTime * _C_b_spec + (intTime * star_template_scaled_C_sp)**2)
 
                 # Compute SNR with matched filter formula ignoring any correlations
-                SNR_dict[pl_template_name[0]+"_ignore_corr"][j] = np.sqrt(np.nansum(m**2/s**2))
+                SNR_dict["SNR_"+pl_template_name[0]+"_ignore_corr"][j] = np.sqrt(np.nansum(m**2/s**2))
                 # SNR per spectral bin
-                SNR_dict[pl_template_name[0]+"_avg_per_bin"][j] = np.nanmean(m/s)
-                # This is for the default SNR being returned by the function. Currently set to the SNR where the correlations are ignored.
-                SNR[j] = SNR_dict[pl_template_name[0]+"_ignore_corr"][j]
+                SNR_dict["SNR_"+pl_template_name[0]+"_avg_per_bin"][j] = np.nanmean(m/s)
 
                 if "chromaticity_dwave_nm" in syst.keys():
                     inv_cov0,cov_matrix0,corr_matrix0 = self.compute_cov_matrices(data_waves, WA[j], syst["chromaticity_dwave_nm"],
                                                                                intTime * star_template_scaled_C_sp,
                                                                                np.sqrt(intTime * _C_b_spec))
                     # Broadband SNR accounting for the covariance.
-                    SNR_dict[pl_template_name[0] + "_corr"][j] = np.sqrt(np.linalg.multi_dot([m.T,inv_cov0,m]))
+                    SNR_dict["SNR_"+pl_template_name[0] + "_corr"][j] = np.sqrt(np.linalg.multi_dot([m.T,inv_cov0,m]))
 
                     #####
                     ## The following is trying to decompose the spectrum into a small scale and large scale features to
@@ -702,7 +734,7 @@ class MHRS(OpticalSystem):
                     corr_scale = np.clip(corr_scale, 0, (syst["chromaticity_dwave_nm"] * u.nm).to(corr_scale.unit))
 
                     # Only go through the separation of the small/large scale if the there is a non-zero correlation length
-                    if not np.any(corr_scale.value == 0):
+                    if not np.any(corr_scale.to(u.nm).value < np.max(np.diff(data_waves.to(u.nm).value))):
                         # Convert to resolution
                         corr_R = data_waves.to(u.nm).value/corr_scale.to(u.nm).value
 
@@ -724,34 +756,43 @@ class MHRS(OpticalSystem):
 
                         # SNR only including the features with a spectral scale SMALLER than the correlation length (ie, HIGH-pass filtered)
                         s_ss = np.sqrt(intTime * _C_b_spec)
-                        SNR_dict[pl_template_name[0] + "_uncorr_small_scale"][j] = np.sqrt(np.nansum(m_ss ** 2 / s_ss ** 2))
+                        SNR_dict["SNR_"+pl_template_name[0] + "_uncorr_small_scale"][j] = np.sqrt(np.nansum(m_ss ** 2 / s_ss ** 2))
 
                         var_ls_uncorr = intTime * downsample_spectrum(data_waves.to_value(u.nm), _C_b_spec, ls_waves.to_value(u.nm))
-                        inv_cov,cov_matrix,corr_matrix = self.compute_cov_matrices(ls_waves, WA, syst["chromaticity_dwave_nm"],
+                        inv_cov,cov_matrix,corr_matrix = self.compute_cov_matrices(ls_waves, WA[j], syst["chromaticity_dwave_nm"],
                                                                                    corr_starlight_ls,np.sqrt(var_ls_uncorr))
 
                         # SNR only including the features with a spectral scale LARGER than the correlation length  (ie, LOW-pass filtered)
-                        SNR_dict[pl_template_name[0] + "_corr_large_scale"][j] = np.sqrt(np.linalg.multi_dot([m_ls.T,inv_cov,m_ls]))
+                        SNR_dict["SNR_"+pl_template_name[0] + "_corr_large_scale"][j] = np.sqrt(np.linalg.multi_dot([m_ls.T,inv_cov,m_ls]))
                         # Simply combine the small scale and large scale SNRs in quadrature for comparison
-                        SNR_dict[pl_template_name[0] + "_corr_test"][j] = np.sqrt(SNR_dict[pl_template_name[0] + "_corr_large_scale"][j]**2+
-                                                                             SNR_dict[pl_template_name[0] + "_uncorr_small_scale"][j]**2)
+                        SNR_dict["SNR_"+pl_template_name[0] + "_corr_test"][j] = np.sqrt(SNR_dict["SNR_"+pl_template_name[0] + "_corr_large_scale"][j]**2+
+                                                                             SNR_dict["SNR_"+pl_template_name[0] + "_uncorr_small_scale"][j]**2)
                 ########
                 ## If molecular templates are available, then process those:
                 for pl_mol_template, mol_name in zip(pl_template[1::],pl_template_name[1::]):
 
                     m = intTime * pl_mol_template_scaled_C_p[mol_name]
-                    SNR_dict[mol_name+"_ignore_corr"][j] = np.sqrt(np.nansum(m**2/s**2))
-                    SNR_dict[mol_name + "_corr"][j] = np.sqrt(np.linalg.multi_dot([m.T,inv_cov0,m]))
+                    SNR_dict["SNR_"+mol_name+"_ignore_corr"][j] = np.sqrt(np.nansum(m**2/s**2))
+                    SNR_dict["SNR_"+mol_name + "_corr"][j] = np.sqrt(np.linalg.multi_dot([m.T,inv_cov0,m]))
 
                     # Only go through the separation of the small/large scale if the there is a non-zero correlation length
-                    if not np.any(corr_scale.value == 0):
+                    if not np.any(corr_scale.to(u.nm).value < np.max(np.diff(data_waves.to(u.nm).value))):
                         m_ls = broaden(data_waves, m, corr_R, kernel="gaussian",n_jobs=n_jobs)
                         m_ss = m-m_ls
-                        SNR_dict[mol_name + "_uncorr_small_scale"][j] = np.sqrt(np.nansum(m_ss ** 2 / s_ss ** 2))
+                        SNR_dict["SNR_"+mol_name + "_uncorr_small_scale"][j] = np.sqrt(np.nansum(m_ss ** 2 / s_ss ** 2))
                         m_ls = downsample_spectrum(data_waves.to_value(u.nm), m_ls, ls_waves.to_value(u.nm))
-                        SNR_dict[mol_name + "_corr_large_scale"][j] = np.sqrt(np.linalg.multi_dot([m_ls.T,inv_cov,m_ls]))
-                        SNR_dict[mol_name + "_corr_test"][j] = np.sqrt(SNR_dict[mol_name + "_corr_large_scale"][j]**2+
-                                                                  SNR_dict[mol_name + "_uncorr_small_scale"][j]**2)
+                        # print(data_waves.to_value(u.nm).shape,data_waves.to_value(u.nm))
+                        # print(ls_waves.to_value(u.nm).shape,ls_waves.to_value(u.nm))
+                        SNR_dict["SNR_"+mol_name + "_corr_large_scale"][j] = np.sqrt(np.linalg.multi_dot([m_ls.T,inv_cov,m_ls]))
+                        SNR_dict["SNR_"+mol_name + "_corr_test"][j] = np.sqrt(SNR_dict["SNR_"+mol_name + "_corr_large_scale"][j]**2+
+                                                                  SNR_dict["SNR_"+mol_name + "_uncorr_small_scale"][j]**2)
+
+                # This is for the default SNR being returned by the function.
+                # Use the SNR with the covariance is valid, otherwise the "ignore correlation" one.
+                if np.isfinite(SNR_dict["SNR_"+pl_template_name[0]+"_corr"][j]):
+                    SNR[j] = SNR_dict["SNR_" + pl_template_name[0] + "_corr"][j]
+                else:
+                    SNR[j] = SNR_dict["SNR_"+pl_template_name[0]+"_ignore_corr"][j]
 
                 if figs is not None:
 
@@ -812,8 +853,9 @@ class MHRS(OpticalSystem):
                     plt.grid(True)
                     # plt.tight_layout()
                     # plt.show()
-
-            return SNR,SNR_dict
+            if output_filename is not None:
+                write_snr_results_to_file(SNR_dict, output_filename, config_json_path=config_json_path)
+            return SNR
         else:
             # electron counts
             C_p, C_b, C_sp = self.Cp_Cb_Csp(TL, sInds, fZ, JEZ, dMag, WA, mode, TK=TK)
@@ -857,7 +899,6 @@ class MHRS(OpticalSystem):
 
         cov_matrix = np.diag(std_uncorr**2) + (std_corr[:, None] * std_corr[None, :]) * corr_matrix
         cov_matrix = cov_matrix.value
-        print(cov_matrix)
 
         # (sign, logdet) = np.linalg.slogdet(cov_matrix)
         # print(sign, logdet)
@@ -1607,6 +1648,7 @@ def downsample_spectrum(wave0, spec0, new_wave):
     -------
     new_spec : np.ndarray
         Downsampled spectrum: sum of spec0 within each bin.
+        Returns full of zeros if np.size(new_wave) < np.size(wave0).
     """
 
     if isinstance(spec0, Quantity):
@@ -1615,6 +1657,9 @@ def downsample_spectrum(wave0, spec0, new_wave):
     else:
         spec0_nounit = spec0
         spec0_unit = 1
+
+    if np.size(new_wave) > np.size(wave0):
+        return np.zeros_like(new_wave)*spec0_unit
 
     # Define bin edges from midpoints between new_wave values
     bin_edges = np.zeros(len(new_wave) + 1)
@@ -1662,3 +1707,224 @@ def regularized_inverse(cov, threshold=1e-10):
     inv_cov = eigvecs @ np.diag(1.0 / eigvals_clamped) @ eigvecs.T
 
     return inv_cov, reg_cov,eigvecs
+
+
+
+def write_snr_results_to_file(results_dict, output_filename, config_json_path=None):
+    """
+    Write a machine-readable summary of SNR analysis results to a structured text file.
+
+    This function formats and writes the contents of a results dictionary to a tab-delimited
+    text file. The file includes:
+
+    - A commented header section describing the meaning of each column.
+    - A table where each row corresponds to a star and each column to a specific SNR metric.
+    - A commented copy of the JSON configuration file used to generate the results,
+      appended at the end for reproducibility.
+
+    Parameters
+    ----------
+    results_dict : dict
+        Dictionary containing the SNR results. Must include a key 'stars' (array of star names)
+        and any number of SNR keys with NumPy arrays of the same length as 'stars'.
+        Expected key pattern: 'SNR_<mol>_<type>'.
+
+    config_json_path : str
+        Path to the JSON configuration file used to generate the results. This will be appended
+        at the end of the output file as a commented block for reference.
+
+    output_filename : str
+        Path to the output text file where the results will be written. Existing files
+        with the same name will be overwritten.
+    """
+    snr_keys = [key for key in results_dict.keys() if "stars" not in key]
+
+    descriptions = {
+        "star": "The name of the stars corresponding to each SNR values.",
+        "SNR_<mol>_avg_per_bin": "SNR per spectral bin",
+        "SNR_<mol>_ignore_corr": "Broadband SNR ignoring any correlations in the data.",
+        "SNR_<mol>_corr": "Broadband SNR accounting for the covariance.",
+        "SNR_<mol>_uncorr_small_scale": "SNR including features smaller than correlation length (high-pass)",
+        "SNR_<mol>_corr_large_scale": "SNR including features larger than correlation length (low-pass)",
+        "SNR_<mol>_corr_test": "Quadrature sum of small and large scale SNRs"
+    }
+
+    # Define field widths
+    star_width = max(len(s) for s in results_dict["stars"]) + 2
+    snr_width = max(len(s) for s in snr_keys) + 2  # Enough for header + float formatting
+
+    with open(output_filename, 'w') as f:
+        # Write header comments
+        f.write("# SNR output table\n")
+        f.write("# Column descriptions:\n")
+        for key in descriptions.keys():
+            f.write(f"# {key}: {descriptions[key]}\n")
+        f.write("#\n")
+
+        # Write column headers
+        header = ["star".ljust(star_width)] + [key.ljust(snr_width) for key in snr_keys]
+        f.write("\t".join(header) + "\n")
+
+        # Write data rows
+        stars = results_dict["stars"]
+        for i in range(len(stars)):
+            row = [stars[i].ljust(star_width)]
+            for key in snr_keys:
+                val = results_dict[key][i]
+                val_str = "nan" if np.isnan(val) else f"{val:.2f}"
+                row.append(val_str.rjust(snr_width))
+            f.write("\t".join(row) + "\n")
+
+        if config_json_path is not None:
+            # Append JSON config at the end as comments
+            f.write("\n# Configuration parameters used:\n")
+            with open(config_json_path, "r") as cf:
+                config_lines = cf.readlines()
+                for line in config_lines:
+                    f.write("# " + line)
+
+
+def read_snr_results_from_file(filename):
+    """
+    Read a structured tab-delimited SNR output text file and reconstruct the original results dictionary.
+
+    This function parses a file generated by `write_snr_results_to_file`. It automatically extracts:
+
+    - Column headers from the first non-comment line
+    - Star names from the first column of each row (supports names with spaces)
+    - SNR values from the remaining columns, converting "nan" to `np.nan` and numeric strings to floats
+
+    The function skips:
+    - All comment lines starting with '#'
+    - The JSON configuration block at the end of the file
+
+    Parameters
+    ----------
+    filename : str
+        Path to the SNR output text file.
+
+    Returns
+    -------
+    results_dict : dict
+        Dictionary with keys:
+        - 'stars' : NumPy array of star names (dtype=str)
+        - one key per SNR metric, each mapping to a NumPy array of float values
+
+    Raises
+    ------
+    ValueError
+        If no valid data lines are found in the file.
+    """
+    with open(filename, 'r') as f:
+        lines = f.readlines()
+
+    # Skip comment lines and find the header
+    header_line = next(line for line in lines if not line.strip().startswith("#"))
+    headers = header_line.strip().split("\t")
+    snr_keys = headers[1:]  # exclude "star"
+    snr_keys = [key.strip() for key in snr_keys]
+
+    results_dict = {"stars": []}
+    for key in snr_keys:
+        results_dict[key] = []
+
+    for line in lines:
+        if line.strip().startswith("#") or not line.strip() or line.strip().startswith("{"):
+            continue  # Skip comments, blank lines, or start of config
+        if line == header_line:
+            continue  # Already parsed header
+
+        fields = line.strip().split("\t")
+        if len(fields) < len(headers):
+            continue  # Incomplete row or junk at the bottom
+
+        # First column is star name (can have spaces), rest are floats or "nan"
+        results_dict["stars"].append(fields[0].strip())
+        for key, val in zip(snr_keys, fields[1:]):
+            results_dict[key].append(np.nan if val.strip() == "nan" else float(val))
+
+    # Convert lists to numpy arrays
+    results_dict["stars"] = np.array(results_dict["stars"], dtype=str)
+    for key in snr_keys:
+        results_dict[key] = np.array(results_dict[key], dtype=float)
+
+    return results_dict
+
+import json
+def read_snr_results_and_json_from_file(filename):
+    """
+    Read a structured tab-delimited SNR output text file and reconstruct the original results dictionary
+    and a trailing JSON configuration block written as commented lines.
+
+    Parameters
+    ----------
+    filename : str
+        Path to the SNR output text file.
+
+    Returns
+    -------
+    results_dict : dict
+        Dictionary with keys:
+        - 'stars' : NumPy array of star names (dtype=str)
+        - one key per SNR metric, each mapping to a NumPy array of float values
+
+    config_dict : dict
+        Dictionary parsed from the JSON block at the end of the file (if present), or empty dict.
+    """
+    with open(filename, 'r') as f:
+        lines = f.readlines()
+
+    # Identify the header line (first non-comment)
+    header_line = next(line for line in lines if not line.strip().startswith("#"))
+    headers = header_line.strip().split("\t")
+    snr_keys = [key.strip() for key in headers[1:]]  # skip 'star' column
+
+    results_dict = {"stars": []}
+    for key in snr_keys:
+        results_dict[key] = []
+
+    data_started = False
+    json_lines = []
+
+    for line in lines:
+        if line.strip().startswith("#") or not line.strip() or line.strip().startswith("{"):
+            continue  # Skip comments, blank lines, or start of config
+        if line == header_line:
+            continue  # Already parsed header
+
+        fields = line.strip().split("\t")
+        if len(fields) < len(headers):
+            continue  # Incomplete row or junk at the bottom
+
+        # First column is star name (can have spaces), rest are floats or "nan"
+        results_dict["stars"].append(fields[0].strip())
+        for key, val in zip(snr_keys, fields[1:]):
+            results_dict[key].append(np.nan if val.strip() == "nan" else float(val))
+
+    for line in lines:
+        if not data_started:
+            if not line.startswith("#"):
+                data_started = True
+            continue  # skip pre-header comments
+
+        # After table ends, collect JSON-comment lines
+        if line.startswith("#"):
+            json_lines.append(line.lstrip("#"))
+        continue
+
+
+    # Convert lists to arrays
+    results_dict["stars"] = np.array(results_dict["stars"], dtype=str)
+    for key in snr_keys:
+        results_dict[key] = np.array(results_dict[key], dtype=float)
+
+    # Parse JSON block
+    config_dict = {}
+    if json_lines:
+        try:
+            json_str = "".join(json_lines[1::])
+            config_dict = json.loads(json_str)
+        except json.JSONDecodeError as e:
+            raise ValueError(f"Could not parse JSON block: {e}")
+
+    return results_dict, config_dict
