@@ -113,16 +113,16 @@ class MHRS(OpticalSystem):
 
     def Cp_Cb_Csp_helper(self, TL, sInds, fZ, JEZ, dMag, WA, mode):
         out = super().Cp_Cb_Csp_helper(TL, sInds, fZ, JEZ, dMag, WA, mode)
+        #C_star, C_p, C_sr, C_z, C_ez, C_dc, C_bl, Npix = out
 
         if "spectro" in mode["inst"]["name"].lower():
             # Undo the flux scaling for spectroscopy mode:
-            #     Why? By default, the flux is computed in a single spectral bin for spectroscopy, but that's not the desire
+            #     Why? By default, the flux is computed in a single spectral resolution element for spectroscopy, but that's not the desire
             # behavior since the S/N per bin is not the relevant metric here, so we make sure that the flux rates are
             # always computed for the full bandpass.
-            pixPerLens = mode["inst"]["lenslSamp"] ** 2.0
-            spectral_bin_to_bandpass = 1/(pixPerLens*mode["deltaLam_eff"]/ mode["deltaLam"])
-            Npix = out[7]
-            C_dc = out[5]
+            spectral_bin_to_bandpass = 1/(mode["deltaLam_eff"]/ mode["deltaLam"])
+            Npix = out[7]/mode["inst"]["lenslSamp"] # This is N pixels per bin
+            C_dc = Npix * mode["inst"]["idark"] # This is dark current per bin
             C_star, C_p, C_sr, C_z, C_ez, C_bl = [f*spectral_bin_to_bandpass for f in out[0:5]+out[6:7]]
         else:
             C_star, C_p, C_sr, C_z, C_ez, C_dc, C_bl, Npix = out
@@ -684,6 +684,7 @@ class MHRS(OpticalSystem):
             SNR_dict["C_readnoise"] = np.nansum(np.array(intTime * _C_rn_spec_list),axis=1)
             SNR_dict["C_dark"] = np.nansum(np.array(intTime * _C_dc_spec_list),axis=1)
             SNR_dict["C_CIC"] = np.nansum(np.array(intTime * _C_cc_spec_list),axis=1)
+            print(SNR_dict["C_readnoise"],SNR_dict["C_dark"],SNR_dict["C_CIC"],SNR_dict["C_readnoise"]+SNR_dict["C_dark"]+SNR_dict["C_CIC"])
 
             pl_mol_template_scaled_C_p_list = C_extra["C_p_mol_spec"]
 
