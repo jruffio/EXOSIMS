@@ -191,7 +191,7 @@ class MHRS(OpticalSystem):
         else:
             texp = inst["texp"].to_value(u.s)
         # readout noise
-        _C_rn = Npix * inst["sread"] / texp
+        _C_rn = Npix * inst["sread"]**2 / texp
 
         # clock-induced-charge
         _C_cc = Npix * inst["CIC"] / texp
@@ -397,7 +397,7 @@ class MHRS(OpticalSystem):
 
         for j in range(len(sInds)):
 
-            _, _, C_sp,C_extra = self.Cp_Cb_Csp(TL, sInds[j], fZ[j], JEZ[j], dMag[j], WA[j], mode, TK=TK,returnExtra=True)
+            _, _, C_sp,C_extra = self.Cp_Cb_Csp(TL, sInds[j:j+1], fZ[j:j+1], JEZ[j:j+1], dMag[j:j+1], WA[j:j+1], mode, TK=TK,returnExtra=True)
             _C_p0 = C_extra["C_p0"]
             _C_sr =  C_extra["C_sr"]#*0.41616687/0.00069059
             _C_z =  C_extra["C_z"]
@@ -406,9 +406,6 @@ class MHRS(OpticalSystem):
             _C_bl = C_extra["C_bl"]
             _C_star = C_extra["C_star"]
             Npix = C_extra["Npix"]
-            if "override_local_starlight_flux_ratio" in mode["syst"].keys():
-                _C_sr = _C_star* mode["syst"]["override_local_starlight_flux_ratio"]
-                C_sp = _C_sr * TL.PostProcessing.ppFact_char(WA) * self.stabilityFact
 
             # Obtain the renormalized spectral template using the new method
             # JB note: apparently the resolution is about ~500, for now hard coding R_star = 500
@@ -456,7 +453,7 @@ class MHRS(OpticalSystem):
             else:
                 texp = inst["texp"].to(u.s)
             # readout noise
-            _C_rn_spec = np.full_like(pl0_template_scaled_C_p0, Npix * inst["sread"] / texp)
+            _C_rn_spec = np.full_like(pl0_template_scaled_C_p0, Npix * inst["sread"]**2 / texp)
 
             # clock-induced-charge
             _C_cc_spec = np.full_like(pl0_template_scaled_C_p0, Npix * inst["CIC"] / texp)
@@ -1345,7 +1342,7 @@ class MHRS(OpticalSystem):
         if self.texp_flag:
             # When using texp_flag the frame time is 1/(10*C_p0) which affects
             # the clock induced charge and the read noise terms
-            a0 += 10 * k_det * Npix * (ENF2 * inst["CIC"] + inst["sread"])
+            a0 += 10 * k_det * Npix * (ENF2 * inst["CIC"] + inst["sread"]**2)
         else:
             a1 += k_det * (ENF2 * _Ccc + _Crn)
         if not mode["detectionMode"]:
@@ -1464,7 +1461,11 @@ def broaden(
         spectrum_nounit,
         np.full(n_pad, spectrum_nounit[np.where(np.isfinite(spectrum_nounit))[0][-1]])
     ])
-    wl_pad_diff = np.diff(wl_pad, prepend=2 * wl_pad[0] - wl_pad[1])
+    # wl_pad_diff = np.diff(wl_pad, prepend=2 * wl_pad[0] - wl_pad[1])
+    wl_pad_diff = np.empty_like(wl_pad)
+    wl_pad_diff[1:-1] = 0.5 * (wl_pad[2:] - wl_pad[:-2])
+    wl_pad_diff[0] = wl_pad[1] - wl_pad[0]  # forward diff at start
+    wl_pad_diff[-1] = wl_pad[-1] - wl_pad[-2]
 
     if wave_samples_only is not None:
         indices_to_process = find_bracketing_indices(wavelengths.to_value(u.nm), wave_samples_only.to_value(u.nm))
