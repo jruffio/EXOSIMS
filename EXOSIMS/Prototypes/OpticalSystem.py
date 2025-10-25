@@ -2048,13 +2048,6 @@ class OpticalSystem(object):
                 )
 
             # finally, if a contrast floor was set, make sure we're not violating it
-            # print(syst["contrast_floor"],"bye")
-            # print(core_intensity , core_thruput)
-            # print(core_intensity / core_thruput, syst["contrast_floor"])
-            # print((core_intensity / core_thruput) < syst["contrast_floor"])
-            # below_contrast_floor = (core_intensity / core_thruput < syst["contrast_floor"])
-            # print(syst["contrast_floor"] * core_thruput[below_contrast_floor])
-            # exit()
             if syst["contrast_floor"] is not None:
                 below_contrast_floor = (
                     core_intensity / core_thruput < syst["contrast_floor"]
